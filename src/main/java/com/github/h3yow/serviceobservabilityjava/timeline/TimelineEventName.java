@@ -1,0 +1,17 @@
+package com.github.h3yow.serviceobservabilityjava.timeline;
+
+/**
+ * 有界的事件名集合。
+ */
+public enum TimelineEventName {
+    REQUEST_RECEIVED,
+    WORK_DISPATCHED,
+    DOWNSTREAM_CALL_STARTED,
+    DOWNSTREAM_CALL_RETRY,
+    DOWNSTREAM_CALL_FAILED,
+    DOWNSTREAM_CALL_TIMEOUT,
+    DOWNSTREAM_CALL_SUCCEEDED,
+    BUSINESS_REJECTED,
+    REQUEST_COMPLETED,
+    REQUEST_FAILED
+}
