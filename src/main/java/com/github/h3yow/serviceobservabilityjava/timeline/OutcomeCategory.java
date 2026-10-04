@@ -6,6 +6,7 @@ package com.github.h3yow.serviceobservabilityjava.timeline;
 public enum OutcomeCategory {
     SUCCESS,
     BUSINESS_REJECTION,
+    BUDGET_EXHAUSTED,
     INVALID_REQUEST,
     SYSTEM_ERROR,
     UNMATCHED

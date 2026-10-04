@@ -5,6 +5,8 @@ package com.github.h3yow.serviceobservabilityjava.timeline;
  */
 public enum TimelineEventName {
     REQUEST_RECEIVED,
+    BUDGET_DECIDED,
+    BUDGET_EXHAUSTED,
     WORK_DISPATCHED,
     DOWNSTREAM_CALL_STARTED,
     DOWNSTREAM_CALL_RETRY,

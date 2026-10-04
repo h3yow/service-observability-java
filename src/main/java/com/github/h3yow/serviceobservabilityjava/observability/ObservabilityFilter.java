@@ -1,5 +1,8 @@
 package com.github.h3yow.serviceobservabilityjava.observability;
 
+import com.github.h3yow.serviceobservabilityjava.budget.BudgetDecision;
+import com.github.h3yow.serviceobservabilityjava.budget.Budgets;
+import com.github.h3yow.serviceobservabilityjava.budget.RequestBudget;
 import com.github.h3yow.serviceobservabilityjava.correlation.CorrelationContext;
 import com.github.h3yow.serviceobservabilityjava.correlation.CorrelationContextHolder;
 import com.github.h3yow.serviceobservabilityjava.correlation.CorrelationIds;
@@ -64,7 +67,11 @@ public final class ObservabilityFilter extends OncePerRequestFilter {
                 decision.raw());
         RequestTimeline timeline = new DefaultRequestTimeline(decision.id(), request.getMethod(),
                 request.getRequestURI(), startNanos);
-        RequestScope scope = new RequestScope(context, timeline);
+        // 请求级总时间预算：与同一时间原点起算，整个请求只创建这一份。
+        String rawBudget = request.getHeader(Budgets.HEADER);
+        BudgetDecision budgetDecision = Budgets.decide(rawBudget);
+        RequestBudget budget = new RequestBudget(budgetDecision, startNanos);
+        RequestScope scope = new RequestScope(context, timeline, budget);
 
         CorrelationContextHolder.begin(context);
         RequestScopeHolder.begin(scope);
@@ -83,6 +90,13 @@ public final class ObservabilityFilter extends OncePerRequestFilter {
                 return;
             }
             scope.addEvent(TimelineEventName.REQUEST_RECEIVED, 0, request.getMethod());
+            // 预算判定进时间线：来源与生效值可查询，且每请求只记一次。
+            scope.addEvent(TimelineEventName.BUDGET_DECIDED, 0,
+                    "source=" + budgetDecision.source()
+                            + " effectiveMillis=" + budgetDecision.effectiveMillis());
+            log.info("budget decision rawHeader={} source={} effectiveMillis={} basis={}",
+                    rawBudget, budgetDecision.source(), budgetDecision.effectiveMillis(),
+                    budgetDecision.reason());
             filterChain.doFilter(request, response);
         } catch (Exception ex) {
             // 异常处理器未覆盖到的兜底（如过滤器链内抛出）：根因不丢、结果可分类。
