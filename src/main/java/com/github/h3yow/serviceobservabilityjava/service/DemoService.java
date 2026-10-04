@@ -1,5 +1,7 @@
 package com.github.h3yow.serviceobservabilityjava.service;
 
+import com.github.h3yow.serviceobservabilityjava.budget.RequestBudget;
+import com.github.h3yow.serviceobservabilityjava.budget.RequestBudgetExhaustedException;
 import com.github.h3yow.serviceobservabilityjava.correlation.CorrelationContextHolder;
 import com.github.h3yow.serviceobservabilityjava.downstream.BusinessRejectionException;
 import com.github.h3yow.serviceobservabilityjava.downstream.DownstreamException;
@@ -49,9 +51,20 @@ public class DemoService {
     }
 
     public Map<String, Object> process(FaultSpec spec, long timeoutMillis) {
-        long deadline = Math.max(1L, Math.min(timeoutMillis, MAX_TIMEOUT_MILLIS));
+        long perCallDeadline = Math.max(1L, Math.min(timeoutMillis, MAX_TIMEOUT_MILLIS));
         RequestScope scope = RequestScopeHolder.current();
-        scope.addEvent(TimelineEventName.WORK_DISPATCHED, 0, "deadlineMillis=" + deadline);
+        RequestBudget budget = scope.budget();
+        // 单次调用截止时间 = min(单次上限, 共享预算剩余)：预算与单次超时同源扣减，不叠加放大。
+        long remaining = budget.remainingMillis();
+        if (remaining <= 0L) {
+            scope.addEvent(TimelineEventName.REQUEST_BUDGET_EXHAUSTED, 0,
+                    "before dispatch budgetMillis=" + budget.budgetMillis());
+            throw new RequestBudgetExhaustedException(
+                    "request budget of " + budget.budgetMillis() + "ms already exhausted before dispatch");
+        }
+        long deadline = Math.min(perCallDeadline, remaining);
+        scope.addEvent(TimelineEventName.WORK_DISPATCHED, 0,
+                "deadlineMillis=" + deadline + " budgetRemainingMillis=" + remaining);
 
         FutureTask<Map<String, Object>> task = new FutureTask<>(() -> runInWorker(scope, spec));
         // workerExecutor 已负责关联标识传播；请求作用域在此显式恢复（含还原，防止线程复用串号）。
@@ -60,6 +73,14 @@ public class DemoService {
             return task.get(deadline, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             task.cancel(true);
+            if (budget.exhausted()) {
+                // 是整条请求的预算耗尽，而非单次下游调用超时：原因必须可区分，且不得触发重试。
+                scope.addEvent(TimelineEventName.REQUEST_BUDGET_EXHAUSTED, 0,
+                        "awaiting downstream budgetMillis=" + budget.budgetMillis());
+                throw new RequestBudgetExhaustedException(
+                        "request budget of " + budget.budgetMillis()
+                                + "ms exhausted while awaiting downstream", e);
+            }
             scope.addEvent(TimelineEventName.DOWNSTREAM_CALL_TIMEOUT, 0,
                     "deadlineMillis=" + deadline);
             throw new DownstreamException("downstream work did not finish within " + deadline + "ms", e);
@@ -80,7 +101,9 @@ public class DemoService {
         try {
             log.info("worker start on thread={}", Thread.currentThread().getName());
             int[] attempts = {0};
-            String primary = invokePrimaryWithRetry(spec, attempts);
+            String primary = invokePrimaryWithRetry(scope, spec, attempts);
+            // 嵌套调用前同样检查共享预算：预算耗尽时不再发起新调用。
+            checkBudget(scope, 0, "before nested audit call");
             // 嵌套调用：独立标签、不重试、不产生额外聚合（聚合只在请求边界计一次）。
             String audit = client.call("audit", 1, new FaultSpec(FaultSpec.MODE_NONE, 0L, 0));
 
@@ -101,10 +124,12 @@ public class DemoService {
         }
     }
 
-    private String invokePrimaryWithRetry(FaultSpec spec, int[] attempts) {
+    private String invokePrimaryWithRetry(RequestScope scope, FaultSpec spec, int[] attempts) {
         RuntimeException lastFailure = null;
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             attempts[0] = attempt;
+            // 每次尝试（含重试）都从同一份预算里扣：耗尽即停，不再发起新尝试。
+            checkBudget(scope, attempt, "before attempt");
             try {
                 return client.call("primary", attempt, spec);
             } catch (BusinessRejectionException e) {
@@ -121,6 +146,21 @@ public class DemoService {
         }
         // 重试用尽：抛出的仍是最后一次的原始异常，根因链未被覆盖。
         throw lastFailure;
+    }
+
+    /**
+     * 预算耗尽时抛出 {@link RequestBudgetExhaustedException}：
+     * 它不属于下游异常体系，不会被重试捕获，也不会被包装吞掉真实原因。
+     */
+    private static void checkBudget(RequestScope scope, int attempt, String phase) {
+        RequestBudget budget = scope.budget();
+        if (budget.exhausted()) {
+            scope.addEvent(TimelineEventName.REQUEST_BUDGET_EXHAUSTED, attempt,
+                    phase + " budgetMillis=" + budget.budgetMillis());
+            throw new RequestBudgetExhaustedException(
+                    "request budget of " + budget.budgetMillis() + "ms exhausted " + phase
+                            + (attempt > 0 ? " " + attempt : ""));
+        }
     }
 
     private static void backoff() {

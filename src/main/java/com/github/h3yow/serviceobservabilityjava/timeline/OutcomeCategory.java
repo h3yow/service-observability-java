@@ -8,5 +8,6 @@ public enum OutcomeCategory {
     BUSINESS_REJECTION,
     INVALID_REQUEST,
     SYSTEM_ERROR,
+    BUDGET_EXHAUSTED,
     UNMATCHED
 }

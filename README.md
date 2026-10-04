@@ -2,6 +2,8 @@
 
 在一个最小 Spring Boot 3.4 / Java 21 服务上，补齐**关联标识、事件时间线、进程内聚合指标**
 三套能力，并通过**本地故障注入**复现慢调用、失败重试、超时与业务拒绝。
+在此之上提供**请求级总时间预算**：调用方可给出整条请求的总耗时上限，
+重试与嵌套调用共享同一份预算，耗尽时快速、可区分地失败。
 全程不依赖外部服务、真实凭据或付费组件；唯一运行时依赖是 Spring Web，验证只用 JUnit 5。
 
 ## 1. 端点总览
@@ -75,6 +77,8 @@ REQUEST_RECEIVED → WORK_DISPATCHED → DOWNSTREAM_CALL_STARTED(attempt=1)
   不产生额外聚合计数。
 - **去重**：业务拒绝只记一次 `BUSINESS_REJECTED`（不会被错误地记成下游失败）；
   终态事件（COMPLETED/FAILED）统一由过滤器追加一次，异常处理器只标记类别、不重复记事件。
+- **预算耗尽**：共享预算被用光时记 `REQUEST_BUDGET_EXHAUSTED`（含生效预算毫秒数），
+  随后不再发起新尝试/嵌套调用，详见第 6 节。
 - 存储为容量 1000 的有界 LRU（`InMemoryTimelineStore`），超出淘汰最旧，避免无界增长。
 
 ### 3.2 错误分类口径（有界枚举 `OutcomeCategory`）
@@ -85,6 +89,7 @@ REQUEST_RECEIVED → WORK_DISPATCHED → DOWNSTREAM_CALL_STARTED(attempt=1)
 | `BUSINESS_REJECTION` | `BusinessRejectionException`（模拟业务规则拒绝） | 422 | **否** |
 | `INVALID_REQUEST` | 关联标识非法（过滤器处终止）/ 其他 4xx | 400 | 否 |
 | `SYSTEM_ERROR` | 下游 IO 失败、超时、截止时间超时、未预期异常 | 500 | 是（业务拒绝除外） |
+| `BUDGET_EXHAUSTED` | 请求级总时间预算耗尽（见第 6 节） | 504 | **否**（预算已尽，重试无意义） |
 
 ### 3.3 根因不被覆盖
 
@@ -103,7 +108,7 @@ REQUEST_RECEIVED → WORK_DISPATCHED → DOWNSTREAM_CALL_STARTED(attempt=1)
 - **维度（标签全部有界）**：
   - `endpoint`：使用 Spring 路由模板（如 `/api/process`），不使用原始 URL；
     含数字段/查询串/为空的路径统一归一为 `-`；未匹配路由为 `/unmapped`。
-  - `category`：上表 5 个枚举之一。
+  - `category`：上表 6 个枚举之一。
   - `bucket`：固定 5 档耗时区间 `<50ms / 50-100ms / 100-250ms / 250-500ms / >=500ms`
     （下界含、上界不含，最后一档无上界）。
 - 快照按 端点→类别→桶 稳定排序；长时间无流量时快照为空且不产生幽灵数据。
@@ -133,10 +138,81 @@ REQUEST_RECEIVED → WORK_DISPATCHED → DOWNSTREAM_CALL_STARTED(attempt=1)
 | `X-Fault-Delay-Millis` | 0–5000（超出裁剪） | `slow` 模式真实延迟 |
 | `X-Fault-Fail-Attempts` | 0–3（超出裁剪） | `fail` 模式前 N 次失败（0=每次失败，N+1 次恢复） |
 | `X-Timeout-Millis` | 服务侧截止时间（最大 2000） | 超时后中断慢调用并快速失败 |
+| `X-Request-Budget-Millis` | 1–30000 | 整条请求共享的总时间预算，规则见第 6 节 |
 
-## 6. 本地验证方法
+## 6. 请求级总时间预算
 
-### 6.1 自动化测试（无需任何外部服务）
+调用方可以通过请求头 `X-Request-Budget-Millis` 给出**整条请求**能接受的总耗时上限。
+预算是整个请求共享的一份：重试、退避、嵌套审计调用都从同一份里扣，
+不会每换一次调用、每换一个线程就重新起算。
+
+### 6.1 取值规则（`budget.RequestBudgets`）
+
+判定结果确定、四类可区分，并通过响应头 `X-Request-Budget-Millis`（生效值）与
+`X-Request-Budget-Source`（来源）回填：
+
+| 情况 | source | 生效预算 | 行为 |
+| --- | --- | --- | --- |
+| 头缺失或空白 | `defaulted` | 10000ms（默认） | 与不带预算的老调用方完全一致 |
+| 非数字、<=0 | `invalid` | 10000ms（默认） | 回落默认，来源可区分，不报错 |
+| 1–30000 | `provided` | 调用方原值 | 原样生效 |
+| >30000 | `clamped` | 30000ms（上限） | 裁剪到上限 |
+
+- 默认 10000ms 大于既有行为的最坏耗时（单次截止最大 2000ms + 重试），
+  因此**不给预算的老调用方不受任何影响**（兼容范围）。
+- 判定是纯函数、不抛异常：预算头非法不会导致请求失败，只会按上表回落。
+
+### 6.2 预算与超时、重试的配合
+
+- 预算时钟在请求边界（过滤器）与请求同一时间原点起算，挂在 `RequestScope` 上
+  随作用域跨线程传播；`RequestBudget` 本身不可变、无共享可变状态，
+  并发请求之间、线程池复用场景下都互不影响、不串预算。
+- 每次派工的实际等待上限 = `min(单次截止时间, 预算剩余)`：
+  单次超时语义不变，但整条链路不会再被“每次调用各自算超时”层层放大。
+- 每次尝试（含重试）之前、嵌套调用之前都会检查共享预算：
+  已耗尽则立即抛出 `RequestBudgetExhaustedException`，不再发起新尝试、不做无谓退避。
+- 等待中被预算截断（`task.get` 按预算剩余超时）时，同样归因为预算耗尽，
+  并通过 `Future.cancel(true)` 中断工作线程，慢调用在合理时间内停下来，不继续干等。
+
+### 6.3 耗尽时的可区分结果
+
+- `RequestBudgetExhaustedException` 独立于下游异常体系
+  （不是 `DownstreamException` 的子类）：**不会被重试捕获、不会被层层包装**，
+  异常链顶端就是它本身，原始根因（如 `TimeoutException`）保留在 cause 里。
+- 映射为 **504 + `BUDGET_EXHAUSTED`**（`OutcomeCategory` 新增的有界枚举值），
+  与单次下游超时的 500/`SYSTEM_ERROR` 明确区分。
+- 时间线追加有界事件 `REQUEST_BUDGET_EXHAUSTED`（含生效预算毫秒数），
+  事件序号/相对耗时口径不变；聚合指标仍在过滤器 `finally` 每请求恰好计一次，
+  只是类别落 `BUDGET_EXHAUSTED`。**预算数值本身不会成为指标标签**，
+  维度仍然只有 端点×类别×耗时桶，标签基数有界。
+
+### 6.4 本地验证
+
+```bash
+# 预算 200ms，下游慢 1500ms：约 200ms 处停下，504 BUDGET_EXHAUSTED
+curl -i -H 'X-Fault-Mode: slow' -H 'X-Fault-Delay-Millis: 1500' \
+  -H 'X-Request-Budget-Millis: 200' -H 'X-Correlation-Id: req-budget-slow' \
+  http://localhost:8080/api/process
+
+# 预算 60ms，下游每次尝试 20ms 后超时：重试中途预算耗尽，不再发起第 3 次尝试
+curl -i -H 'X-Fault-Mode: timeout' -H 'X-Request-Budget-Millis: 60' \
+  -H 'X-Correlation-Id: req-budget-retry' http://localhost:8080/api/process
+
+# 非法/越界预算：回落或裁剪，来源可区分，请求正常处理
+curl -i -H 'X-Request-Budget-Millis: abc' http://localhost:8080/api/process
+curl -i -H 'X-Request-Budget-Millis: 99999999' http://localhost:8080/api/process
+
+# 时间线里能看到 REQUEST_BUDGET_EXHAUSTED，指标里类别为 BUDGET_EXHAUSTED
+curl -s http://localhost:8080/observability/timelines/req-budget-retry
+curl -s http://localhost:8080/observability/metrics
+```
+
+请求开始处的日志会打印 `budget decision rawHeader=... source=... effectiveMillis=... basis=...`，
+即原始输入与归一化判定依据。
+
+## 7. 本地验证方法
+
+### 7.1 自动化测试（无需任何外部服务）
 
 ```bash
 mvn -o test          # 离线跑全部测试；去掉 -o 可联网
@@ -151,11 +227,13 @@ mvn -o test          # 离线跑全部测试；去掉 -o 可联网
 | `MetricsRegistryTest` | 24 线程×200 次并发写入计数精确、空流量快照稳定、排序稳定、高基数路径归一 |
 | `InMemoryTimelineStoreTest` | 有界 LRU 淘汰、重存变最新、缺失安全 |
 | `FaultSpecTest` | 故障头非法回落与数值裁剪 |
+| `RequestBudgetsTest` | 预算头缺失/非法/越界/合法四类来源、边界值、确定性；日志打印原始输入与判定依据 |
+| `RequestBudgetIntegrationTest` | 重试中途预算耗尽（504 可区分、不重试）、慢调用被预算叫停、非法/越界兜底、预算充足行为不变、12 并发预算隔离 |
 | `ContextPropagationTest` | 400 任务/2 线程复用不串号不泄漏、restore 语义 |
 | `FaultInjectionIntegrationTest` | 三类标识、慢调用落桶、两类超时根因、重试恢复/用尽根因、业务拒绝不重试、嵌套调用、时间线有序、计数一次 |
 | `ConcurrentRequestIntegrationTest` | 24 真实并发请求的标识隔离与按类别精确计数（8+8+4+4=24） |
 
-### 6.2 手动 curl 验证
+### 7.2 手动 curl 验证
 
 ```bash
 mvn -o spring-boot:run        # 启动在 8080
@@ -201,9 +279,11 @@ curl -s -X POST http://localhost:8080/observability/admin/reset
 请求开始处会打印 `correlation decision rawHeader=... source=... effectiveId=... basis=...`，
 即原始输入与归一化判定依据。
 
-## 7. 设计边界
+## 8. 设计边界
 
 - 时间线与指标均为**进程内**实现：重启清空、不跨实例，这是本地可验证方案的有意取舍。
 - 指标/事件的 detail 只放有界信息（模式名、异常简单类名、尝试序号），不放原始用户输入，
   避免日志注入与高基数。
 - 观测端点（`/observability/**`）自身也会被计数；验证业务口径时按 `endpoint=/api/process` 过滤。
+- 预算时钟以请求进入过滤器为原点，包含排队与派工开销——这是“整条请求总耗时”的有意语义；
+  预算默认值（10000ms）远大于既有最坏耗时，不影响不带预算头的老调用方。

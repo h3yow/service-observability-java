@@ -1,5 +1,6 @@
 package com.github.h3yow.serviceobservabilityjava.observability;
 
+import com.github.h3yow.serviceobservabilityjava.budget.RequestBudgetExhaustedException;
 import com.github.h3yow.serviceobservabilityjava.correlation.CorrelationContext;
 import com.github.h3yow.serviceobservabilityjava.correlation.CorrelationContextHolder;
 import com.github.h3yow.serviceobservabilityjava.downstream.BusinessRejectionException;
@@ -40,6 +41,16 @@ public final class GlobalExceptionHandler {
         log.warn("business rejection correlationId={} reason={}", currentId(), ex.getMessage());
         return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
                 .body(errorBody("BUSINESS_REJECTION", 422, ex));
+    }
+
+    @ExceptionHandler(RequestBudgetExhaustedException.class)
+    public ResponseEntity<Map<String, Object>> handleBudgetExhausted(RequestBudgetExhaustedException ex) {
+        // 整条请求的预算耗尽：独立类别 504，与单次下游超时（500/SYSTEM_ERROR）明确区分。
+        markOutcome(OutcomeCategory.BUDGET_EXHAUSTED);
+        log.warn("request budget exhausted correlationId={} rootCauseChain={}",
+                currentId(), causeChain(ex));
+        return ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT)
+                .body(errorBody("BUDGET_EXHAUSTED", 504, ex));
     }
 
     @ExceptionHandler({DownstreamException.class, DownstreamTimeoutException.class})

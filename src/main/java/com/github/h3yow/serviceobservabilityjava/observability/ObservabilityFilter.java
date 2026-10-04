@@ -1,5 +1,7 @@
 package com.github.h3yow.serviceobservabilityjava.observability;
 
+import com.github.h3yow.serviceobservabilityjava.budget.RequestBudget;
+import com.github.h3yow.serviceobservabilityjava.budget.RequestBudgets;
 import com.github.h3yow.serviceobservabilityjava.correlation.CorrelationContext;
 import com.github.h3yow.serviceobservabilityjava.correlation.CorrelationContextHolder;
 import com.github.h3yow.serviceobservabilityjava.correlation.CorrelationIds;
@@ -59,12 +61,16 @@ public final class ObservabilityFilter extends OncePerRequestFilter {
         long startNanos = System.nanoTime();
         String rawHeader = request.getHeader(CorrelationIds.HEADER);
         var decision = CorrelationIds.decide(rawHeader);
+        String rawBudget = request.getHeader(RequestBudgets.HEADER);
+        var budgetDecision = RequestBudgets.decide(rawBudget);
 
         CorrelationContext context = new CorrelationContext(decision.id(), decision.source(),
                 decision.raw());
         RequestTimeline timeline = new DefaultRequestTimeline(decision.id(), request.getMethod(),
                 request.getRequestURI(), startNanos);
-        RequestScope scope = new RequestScope(context, timeline);
+        // 预算时钟与请求同一时间原点起算，全请求（含重试与嵌套调用）共享这一份。
+        RequestBudget budget = new RequestBudget(budgetDecision.effectiveMillis(), startNanos);
+        RequestScope scope = new RequestScope(context, timeline, budget);
 
         CorrelationContextHolder.begin(context);
         RequestScopeHolder.begin(scope);
@@ -73,9 +79,14 @@ public final class ObservabilityFilter extends OncePerRequestFilter {
         // 单测要求可直接观察“原始输入 + 归一化后的判定依据”。
         log.info("correlation decision rawHeader={} source={} effectiveId={} basis={}",
                 rawHeader, decision.source(), decision.id(), decision.reason());
+        log.info("budget decision rawHeader={} source={} effectiveMillis={} basis={}",
+                rawBudget, budgetDecision.source(), budgetDecision.effectiveMillis(),
+                budgetDecision.reason());
 
         response.setHeader(CorrelationIds.HEADER, decision.id());
         response.setHeader(CorrelationIds.SOURCE_HEADER, decision.source());
+        response.setHeader(RequestBudgets.HEADER, String.valueOf(budgetDecision.effectiveMillis()));
+        response.setHeader(RequestBudgets.SOURCE_HEADER, budgetDecision.source());
 
         try {
             if (CorrelationIds.SOURCE_REJECTED.equals(decision.source())) {
@@ -154,6 +165,9 @@ public final class ObservabilityFilter extends OncePerRequestFilter {
         }
         if (status == 422) {
             return OutcomeCategory.BUSINESS_REJECTION;
+        }
+        if (status == 504) {
+            return OutcomeCategory.BUDGET_EXHAUSTED;
         }
         if (status >= 400 && status < 500) {
             return OutcomeCategory.INVALID_REQUEST;

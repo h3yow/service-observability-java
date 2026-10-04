@@ -1,5 +1,6 @@
 package com.github.h3yow.serviceobservabilityjava.observability;
 
+import com.github.h3yow.serviceobservabilityjava.budget.RequestBudget;
 import com.github.h3yow.serviceobservabilityjava.correlation.CorrelationContext;
 import com.github.h3yow.serviceobservabilityjava.timeline.OutcomeCategory;
 import com.github.h3yow.serviceobservabilityjava.timeline.RequestTimeline;
@@ -8,18 +9,21 @@ import com.github.h3yow.serviceobservabilityjava.timeline.TimelineEventName;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * 当前请求的可观测性作用域：关联上下文 + 时间线 + 最终类别。
+ * 当前请求的可观测性作用域：关联上下文 + 时间线 + 最终类别 + 请求级总时间预算。
  * 由过滤器在请求边界建立，业务代码通过当前实例记录事件。
+ * 预算时钟随作用域一起跨线程传播：重试与嵌套调用共享同一份预算，不重新起算。
  */
 public final class RequestScope {
 
     private final CorrelationContext context;
     private final RequestTimeline timeline;
+    private final RequestBudget budget;
     private final AtomicReference<OutcomeCategory> outcome = new AtomicReference<>();
 
-    public RequestScope(CorrelationContext context, RequestTimeline timeline) {
+    public RequestScope(CorrelationContext context, RequestTimeline timeline, RequestBudget budget) {
         this.context = context;
         this.timeline = timeline;
+        this.budget = budget;
     }
 
     public CorrelationContext context() {
@@ -28,6 +32,10 @@ public final class RequestScope {
 
     public RequestTimeline timeline() {
         return timeline;
+    }
+
+    public RequestBudget budget() {
+        return budget;
     }
 
     public long addEvent(TimelineEventName name, int attempt, String detail) {
